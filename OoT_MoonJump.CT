@@ -1,0 +1,270 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="46">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>0</ID>
+      <Description>"Moon jump (hold Page Up or RB)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if MoonJump then MoonJump.start() else showMessage('MoonJump script is not loaded. Reopen the table and click Yes.') end
+{$asm}
+
+[DISABLE]
+{$lua}
+if MoonJump then MoonJump.stop() end
+{$asm}
+</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <LuaScript>-- MoonJump2.lua - Moon jump for OoT (Switch 2 remake) in Lichii. No running needed.
+-- Needs: LichiiOoT.lua add-on (symbol GUEST) and MEM_MAPPED ticked in Scan Settings.
+-- Hold RB (controller) or Page Up (keyboard): Link rises. Release: Link falls.
+if MoonJump and MoonJump.stop then pcall(MoonJump.stop) end
+local MJ = {}
+MoonJump = MJ
+MJ.cfg = { rise = 12.0, kick = 10.0, kicktime = 0.35, pad = 0x200, key = 0x21, hover = false }
+-- pad masks: A 1000, B 2000, X 4000, Y 8000, LB 100, RB 200, L3 40, R3 80
+
+local DIR = [[E:\Emulation\ROMS\Switch 2\Zelda OOT\Claude outputs\]]
+local FUNC = 0x80304BE0
+local SIG = { 0x7F,0x23,0x03,0xD5,0xE8,0x0F,0x1C,0xFC,0xFD,0x7B,0x01,0xA9,0xFC,0x57,0x02,0xA9 }
+local CCT_VT, ACT_VT = 0x84E0BF10, 0x84CFCE18
+local st = { M = {} }
+local logf = io.open(DIR .. "moonjump_ce_log.txt", "w")
+local function say(s)
+  print("[MoonJump] " .. s)
+  if logf then logf:write(s .. "\n"); logf:flush() end
+end
+local function getG()
+  local ok, v = pcall(getAddress, "GUEST")
+  if ok and v and v ~= 0 then return v end
+end
+local function q(g, a) return readQword(g + a) end
+local function f(g, a) return readFloat(g + a) end
+
+local function findShift(g)
+  for s = 0, 0x3000000 - 1, 0x1000 do
+    local b = readBytes(g + FUNC + s, 16, true)
+    if b then
+      local ok = true
+      for i = 1, 16 do if b[i] ~= SIG[i] then ok = false break end end
+      if ok then return s end
+    end
+  end
+end
+
+local function scan(vt, v1, v2, lo, hi, cap, align, g)
+  local ms = createMemScan()
+  ms.firstScan(v2 and soValueBetween or soExactValue, vt, rtRounded, v1, v2 or "", g + lo, g + hi, "", fsmAligned, align or "8", false, true, false, false)
+  ms.waitTillDone()
+  local fl = createFoundList(ms); fl.initialize()
+  local r, n = {}, fl.Count
+  for i = 0, math.min(n, cap) - 1 do r[#r + 1] = tonumber(fl.Address[i], 16) - g end
+  fl.destroy(); ms.destroy()
+  return r, n
+end
+
+local function isPlayer(g, actor)
+  local p = q(g, actor + 0x20)
+  if not p then return false end
+  local b = readBytes(g + p, 7, true)
+  return b and b[1] == 0x50 and b[2] == 0x6C and b[3] == 0x61 and b[4] == 0x79 and b[5] == 0x65 and b[6] == 0x72 and b[7] == 0
+end
+
+local function chain(g, S, actor)
+  local a1 = q(g, actor + 0x270); local a2 = a1 and q(g, a1 + 0x50); local a3 = a2 and q(g, a2 + 0x20)
+  local comp = a3 and q(g, a3 + 0x10); local C = comp and q(g, comp + 0x08)
+  if C and q(g, C) == CCT_VT + S then
+    local A, inner = q(g, C + 0x20), q(g, C + 0x28)
+    if A and inner then return C, A, inner end
+  end
+end
+
+-- Link actor = actor of the shared class whose name is "Player" (found by memory scan, no movement needed)
+local function findLink(g, S)
+  local acts = scan(vtQword, tostring(ACT_VT + S), nil, 0x1000000000, 0x3000000000, 5000, "8", g)
+  say(#acts .. " actors found")
+  for _, a in ipairs(acts) do
+    if q(g, a) == ACT_VT + S and isPlayer(g, a) then
+      local C, A, inner = chain(g, S, a)
+      if C then return { actor = a, C = C, A = A, inner = inner } end
+    end
+  end
+end
+
+-- Physics bodies at Link's position (position group at M+0x38, velocity group at M+0x48, vy lane at M+0x54).
+local function findBodies(g, A)
+  local px, py, pz = f(g, A + 0x8C), f(g, A + 0x9C), f(g, A + 0xAC)
+  local near = function(a, b, t) return a and a == a and math.abs(a - b) &lt; t end
+  local out = {}
+  for _, r in ipairs({ { 0x2162000000, 0x2163000000 }, { 0x2160000000, 0x2164000000 } }) do
+    local hits = scan(vtSingle, string.format("%.4f", px - 0.01), string.format("%.4f", px + 0.01), r[1], r[2], 20000, "4", g)
+    for _, h in ipairs(hits) do
+      if near(f(g, h + 8), pz, 0.02) and near(f(g, h + 4), py, 1.5) and #out &lt; 40 then out[#out + 1] = h + 0x1C end
+    end
+    if #out &gt; 0 then break end
+  end
+  return out
+end
+
+
+-- Physics body of Link, computed like the game does (FUN_81987898 + FUN_819b308c):
+-- entry = [[W+0x48] + blk*8] + e*0xC0 ; idx = u32[entry+0x80] ; M = [[W+0x708] + (idx&gt;&gt;6)*8] + (idx&amp;0x3F)*0x80
+local WORLD_VT = 0x84A8C1B0
+local function computeBodies(g, S, A)
+  local out = {}
+  local ws = {}
+  for _, r in ipairs({ { 0x1000000000, 0x3000000000 }, { 0x80000000 + S, 0x90000000 + S } }) do
+    local hits = scan(vtQword, tostring(WORLD_VT + S), nil, r[1], r[2], 50, "8", g)
+    for _, h in ipairs(hits) do if q(g, h) == WORLD_VT + S then ws[#ws + 1] = h end end
+  end
+  say(#ws .. " physics worlds")
+  local holder = q(g, A + 0x78)
+  local H = holder and q(g, holder + 8)
+  if not H then say("no handle"); return out end
+  say(string.format("handle %X", H))
+  if H &lt; 0x8000000000000000 then say("positive handle: not supported"); return out end
+  local u1 = ((H &amp; 0xFFFFFFFF) &gt;&gt; 1) &amp; 0x7FFFFF
+  local blk = u1 // 0x15
+  local e = (H &amp; 0xFFFFFF) - blk * 0x2A
+  for _, W in ipairs(ws) do
+    local arr = q(g, W + 0x48)
+    local bp = arr and q(g, arr + blk * 8)
+    local entry = bp and (bp + e * 0xC0)
+    local idxr = entry and readInteger(g + entry + 0x80)
+    if idxr then
+      local idx = idxr &amp; 0xFFFFFFFF
+      local arr2 = q(g, W + 0x708)
+      local bp2 = arr2 and q(g, arr2 + ((idx &gt;&gt; 6) &amp; 0x3FFFFFF) * 8)
+      if bp2 then
+        local M = bp2 + (idx &amp; 0x3F) * 0x80
+        local ex, ey, ez = f(g, entry + 0x30), f(g, entry + 0x34), f(g, entry + 0x38)
+        local px, py, pz = f(g, A + 0x8C), f(g, A + 0x9C), f(g, A + 0xAC)
+        local mine = ex and ey and ez and math.abs(ex - px) &lt; 0.05 and math.abs(ey - py) &lt; 0.5 and math.abs(ez - pz) &lt; 0.05
+        say(string.format("world %X entry %X idx %X -&gt; body %X %s", W, entry, idx, M, mine and "(Link)" or "(other)"))
+        if mine then out[#out + 1] = M + 0x54 end
+      end
+    end
+  end
+  return out
+end
+
+-- Controller: XInput called inside the Lichii process.
+local pad = { ok = false, fails = 0 }
+local function initPad()
+  pad.ok = false
+  local okb, buf = pcall(allocateMemory, 64)
+  if not okb then say("Controller: no buffer. Use Page Up."); return end
+  pad.buf = buf
+  for _, dll in ipairs({ "xinput1_4", "xinput1_3", "xinput9_1_0" }) do
+    local ok, a = pcall(getAddress, dll .. ".XInputGetState")
+    if not (ok and a and a ~= 0) then
+      pcall(executeCodeEx, 0, 2000, getAddress("kernel32.LoadLibraryA"), dll .. ".dll")
+      pcall(reinitializeSymbolhandler)
+      ok, a = pcall(getAddress, dll .. ".XInputGetState")
+    end
+    if ok and a and a ~= 0 then pad.fn = a; pad.ok = true; say("Controller input: " .. dll); return end
+  end
+  say("Controller input not available. Use Page Up.")
+end
+
+local function padDown(mask)
+  if not pad.ok then return false end
+  for i = 0, 3 do
+    local ok, r = pcall(executeCodeEx, 0, 200, pad.fn, i, pad.buf)
+    if not ok then
+      pad.fails = pad.fails + 1
+      if pad.fails &gt; 5 then pad.ok = false; say("Controller input stopped. Use Page Up.") end
+      return false
+    end
+    if r == 0 then
+      pad.none = false
+      local b = readSmallInteger(pad.buf + 4)
+      if b and (b &amp; mask) == mask then return true end
+      return false
+    end
+  end
+  pad.none = true
+  return false
+end
+
+local function restore()
+  local g = st.g
+  if g and st.inner and st.og then
+    writeFloat(g + st.inner + 0x238, st.og)
+    writeFloat(g + st.inner + 0x254, st.oe)
+  end
+end
+
+function MJ.stop()
+  if st.timer then st.timer.Enabled = false; st.timer.destroy(); st.timer = nil end
+  pcall(restore)
+  st.running = false
+  say("Stopped. Gravity restored.")
+end
+
+local function resolve()
+  local g = st.g
+  local L = findLink(g, st.S)
+  if not L then return false end
+  restore()
+  st.C, st.A, st.inner, st.actor = L.C, L.A, L.inner, L.actor
+  st.og, st.oe = f(g, L.inner + 0x238), f(g, L.inner + 0x254)
+  st.M = computeBodies(g, st.S, L.A)
+  if #st.M == 0 then say('Link physics body not found') end
+  say(string.format("Link actor %X CCT %X body %X inner %X, physics bodies %d", L.actor, L.C, L.A, L.inner, #st.M))
+  return true
+end
+
+local function tick()
+  local g, c = st.g, MJ.cfg
+  st.n = (st.n or 0) + 1
+  -- check that Link is still the same object (area change): every ~1 s
+  if st.n % 60 == 0 and not st.was and not (q(g, st.C) == CCT_VT + st.S and q(g, st.C + 0x28) == st.inner) then
+    say("Link changed. Searching again.")
+    if not resolve() then say("Link not found."); return end
+  end
+  local k = isKeyPressed(c.key)
+  if not k and c.pad ~= 0 and st.n % (pad.none and 40 or 2) == 0 then k = padDown(c.pad) end
+  k = k and true or false
+  if k ~= st.was then say("key " .. (k and "down" or "up")) end
+  if k and not st.was then
+    st.kickUntil = os.clock() + c.kicktime
+  end
+  st.was = k
+  if k then
+    if os.clock() &lt; st.kickUntil then
+      for _, a in ipairs(st.M) do writeFloat(g + a, c.kick) end
+    end
+    writeFloat(g + st.inner + 0x238, c.rise)
+    writeFloat(g + st.inner + 0x254, c.rise)
+    st.down = true
+  elseif c.hover then
+    writeFloat(g + st.inner + 0x238, 0.0)
+    writeFloat(g + st.inner + 0x254, 0.0)
+  elseif st.down then
+    restore(); st.down = false
+  end
+end
+
+function MJ.start()
+  if st.running then return end
+  local g = getG()
+  if not g then showMessage("MoonJump: symbol GUEST not found.\nInstall LichiiOoT.lua, attach to Lichii, and tick MEM_MAPPED in Scan Settings."); return end
+  st.g = g
+  st.S = findShift(g)
+  if not st.S then showMessage("MoonJump: game code not found. Load your save and try again."); return end
+  say(string.format("Shift 0x%X", st.S))
+  if not resolve() then showMessage("MoonJump: Link not found. Stand in the world and enable again."); return end
+  initPad()
+  st.running, st.down, st.was = true, false, false
+  st.timer = createTimer(nil)
+  st.timer.Interval = 15
+  st.timer.OnTimer = function() local ok, e = pcall(tick); if not ok then say("Error: " .. tostring(e)); MJ.stop() end end
+  st.timer.Enabled = true
+  pcall(beep)
+  say("READY. Hold RB or Page Up to rise. Untick the entry to stop.")
+end
+</LuaScript>
+</CheatTable>
